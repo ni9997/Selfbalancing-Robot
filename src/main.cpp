@@ -29,7 +29,15 @@ const uint8_t MPU6050_REGISTER_INT_ENABLE   =  0x38;
 const uint8_t MPU6050_REGISTER_ACCEL_XOUT_H =  0x3B;
 const uint8_t MPU6050_REGISTER_SIGNAL_PATH_RESET  = 0x68;
 
+//
+// Multiplexer
+//
+const int S0 = D7;      // Multiplex Set Pin
+const int S1 = D8;      // Multiplex Set Pin
+
+//
 //Network
+//
 const char *ssid = "Robot_01";
 const char *pass = "letmeaccessyourdata";
 unsigned int localPort = 2000; // local port to listen for UDP packets
@@ -43,11 +51,42 @@ double ax,az;
 //
 // PID VALUES
 //
+double P = 0.01;
+double I = 0.01;
+double D = 0.01;
+double soll = 0;
 
-const double P = 0.01;
-const double I = 0.01;
-const double D = 0.01;
-const double soll = 0;
+
+//
+//Motor
+//
+// Motor steps per revolution. Most steppers are 200 steps or 1.8 degrees/step
+#define MOTOR_STEPS 200
+// Target RPM for cruise speed
+#define RPM 120
+// Acceleration and deceleration values are always in FULL steps / s^2
+#define MOTOR_ACCEL 2000
+#define MOTOR_DECEL 1000
+
+// Microstepping mode. If you hardwired it to save pins, set to the same value here.
+#define MICROSTEPS 1
+
+//MOTOR 1
+#define DIR 4
+#define STEP 16
+#include "DRV8825.h"
+DRV8825 stepper(MOTOR_STEPS, DIR, STEP);
+
+
+////
+//// STEPPER TEST
+////
+#include <AccelStepper.h>
+
+AccelStepper s(AccelStepper::DRIVER,14,12);
+
+
+
 
 // PID Storage
 double uold = 0;
@@ -64,6 +103,8 @@ void initGyro();
 void initNetwork();
 double calcError(double soll, double ist);
 double calcPID(double error);
+void initMultiplexer();
+void readMultiplexer(double *p, double *i, double *d);
 
 //PID Values
 double calcA(double Ts);
@@ -77,22 +118,57 @@ double samplingTime();
 
 void setup() {
   // put your setup code here, to run once:
-  Serial.begin(9600);
+  Serial.begin(115200);
   Wire.begin(sda, scl);
   initGyro();
-  initNetwork();
+  //initNetwork();
+  initMultiplexer();
   lastTime = millis();
+
+  s.setMaxSpeed(500);
+  //s.run();
+  //stepper.startRotate(65000);  
+  
+  
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
   //Serial.println(calcAngle());
+  double angleteest = calcAngle();
+  if(angleteest != 0)
+    s.setSpeed(300/calcAngle());
+  else
+    s.setSpeed(0);
+  
+  s.runSpeed();
+/*
   double angle = calcAngle();
   double error = calcError(soll, angle);
   //error = 5;
   double test = calcPID(error);
   Serial.print(error); Serial.print(" "); Serial.println(test);
-  delay(50);
+
+  double p = 0;
+  double i = 0;
+  double d = 0;
+
+  readMultiplexer(&p,&i,&d);
+
+  P = p;
+  I = i;
+  D = d;
+/*
+  Serial.print("P= "); Serial.print(p);
+  Serial.print(" I= "); Serial.print(i);
+  Serial.print(" D= "); Serial.println(d);
+  /*
+  stepper.setRPM(((int)test/abs(test)*60));
+  long timer = millis() + abs(test)/10;
+  while(timer > millis()){
+      stepper.nextAction();
+  }
+  */
 }
 
 void initNetwork()
@@ -191,6 +267,14 @@ void initGyro()
   Wire.endTransmission(true);
 }
 
+void initMultiplexer()
+{
+  // MULTIPLEX
+  pinMode(A0, INPUT);
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+}
+
 double calcA(double Ts)
 {
   return (P+ I*Ts/2 + D/Ts);
@@ -211,4 +295,22 @@ double samplingTime()
   long temp = lastTime;
   lastTime = millis();
   return lastTime - temp;
+}
+
+void readMultiplexer(double *p, double *i, double *d)
+{
+  //P
+  digitalWrite(S0, LOW);
+  digitalWrite(S1, LOW);
+  *p = analogRead(A0);
+
+  //I
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+  *i = analogRead(A0);
+
+  //D
+  digitalWrite(S0, LOW);
+  digitalWrite(S1, HIGH);
+  *d = analogRead(A0);
 }
