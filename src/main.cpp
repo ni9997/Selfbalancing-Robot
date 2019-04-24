@@ -18,9 +18,9 @@ const double AccelScaleFactor = 16384;
 const double GyroScaleFactor = 131;
 
 //Various settings
-float pid_p_gain = 15;                                       //Gain setting for the P-controller (15)
-float pid_i_gain = 1.5;                                      //Gain setting for the I-controller (1.5)
-float pid_d_gain = 30;                                       //Gain setting for the D-controller (30)
+double pid_p_gain = 15;                                       //Gain setting for the P-controller (15)
+double pid_i_gain = 1.5;                                      //Gain setting for the I-controller (1.5)
+double pid_d_gain = 30;                                       //Gain setting for the D-controller (30)
 float turning_speed = 30;                                    //Turning speed (20)
 float max_target_speed = 150;                                //Max target speed (100)
 
@@ -39,16 +39,42 @@ long gyro_yaw_calibration_value, gyro_pitch_calibration_value;
 
 unsigned long loop_timer;
 
-float angle_gyro, angle_acc, angle, self_balance_pid_setpoint;
-float pid_error_temp, pid_i_mem, pid_setpoint, gyro_input, pid_output, pid_last_d_error;
+double angle_gyro, angle_acc, angle, self_balance_pid_setpoint;
+double pid_error_temp, pid_i_mem, pid_setpoint, gyro_input, pid_output, pid_last_d_error;
 float pid_output_left, pid_output_right;
 
 
+bool blinkState = false;
 
+// MPU control/status vars
+MPU6050 mpu;
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+// packet structure for InvenSense teapot demo
+uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
 
 // Select SDA and SCL pins for I2C communication 
-const uint8_t scl = D4;
-const uint8_t sda = D3;
+const uint8_t scl = D1;
+const uint8_t sda = D2;
 
 
 //
@@ -74,7 +100,7 @@ void I2C_Write(uint8_t deviceAddress, uint8_t regAddress, uint8_t data);
 
 //MOTOR 1
 #define DIR 5
-#define STEP 16
+#define STEP 0
 // MOTOR 2
 #define DIR2 12
 #define STEP2 14
@@ -86,7 +112,6 @@ void initMultiplexer();
 void readMultiplexer(double *p, double *i, double *d, double *v);
 void initGPIO();
 void Read_RawValue(uint8_t deviceAddress, uint8_t regAddress);
-
 
 
 //Timer
@@ -106,7 +131,7 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(sda, scl);
   Wire.setClock(400000L);
-  initTimer();
+  //initTimer();
   initGPIO();
   initGyro();
   //initNetwork();
@@ -114,6 +139,8 @@ void setup() {
   interrupts();
   last = micros();
   last2=micros();
+
+  //ESP.wdtDisable();
 
   loop_timer = micros() + 4000;
 }
@@ -125,80 +152,84 @@ void loop()
   double d = 0;
   double v = 0;
   readMultiplexer(&p,&i,&d, &v);
-
-  pid_p_gain = 30*p/1024;
+  pid_p_gain = 10*p/1024;
   pid_i_gain = 2*i/1024;
-  pid_d_gain = 50*d/1024;
+  pid_d_gain = 30*d/1024;
 
   Serial.print("T= ");Serial.print(delta);Serial.print(" P= ");Serial.print(pid_p_gain);Serial.print(" I= ");Serial.print(pid_i_gain);Serial.print(" D= ");Serial.print(pid_d_gain);
 
-  //////////////////////////
-  ///// MEIN WINKEL
-  //////////////////////////
-  double Ax, Ay, Az, T, Gx, Gy, Gz;
-  
-  Read_RawValue(gyro_address, 0x3B);
-  
-  //divide each with their sensitivity scale factor
-  Ax = (double)AccelX/AccelScaleFactor;
-  Ay = (double)AccelY/AccelScaleFactor;
-  Az = (double)AccelZ/AccelScaleFactor;
-  //T = (double)Temperature/340+36.53; //temperature formula
-  Gx = (double)GyroX/GyroScaleFactor;
-  Gy = (double)GyroY/GyroScaleFactor;
-  Gz = (double)GyroZ/GyroScaleFactor;
-  angle_gyro = (atan(Az/Ax)* 57.296)+5;
-
-
+  if (!dmpReady) return;
 /*
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  //Angle calculations
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the gyro
-  Wire.write(0x3F);                                                         //Start reading at register 3F
-  Wire.endTransmission();                                                   //End the transmission
-  Wire.requestFrom(gyro_address, 2);                                        //Request 2 bytes from the gyro
-  accelerometer_data_raw = Wire.read()<<8|Wire.read();                      //Combine the two bytes to make one integer
-  //accelerometer_data_raw /= AccelScaleFactor; //Von mir
-  accelerometer_data_raw += acc_calibration_value;                          //Add the accelerometer calibration value
-  if(accelerometer_data_raw > 8200)accelerometer_data_raw = 8200;           //Prevent division by zero by limiting the acc data to +/-8200;
-  if(accelerometer_data_raw < -8200)accelerometer_data_raw = -8200;         //Prevent division by zero by limiting the acc data to +/-8200;
+    // wait for MPU interrupt or extra packet(s) available
+    while (!mpuInterrupt && fifoCount < packetSize) {
+        if (mpuInterrupt && fifoCount < packetSize) {
+          // try to get out of the infinite loop 
+          fifoCount = mpu.getFIFOCount();
+        }  
+        
+        // other program behavior stuff here
+        // .
+        // .
+        // .
+        // if you are really paranoid you can frequently test in between other
+        // stuff to see if mpuInterrupt is true, and if so, "break;" from the
+        // while() loop to immediately process the MPU data
+        // .
+        // .
+        // .
+    }*/
 
-  angle_acc = asin((float)accelerometer_data_raw/8200.0)* 57.296;           //Calculate the current angle according to the accelerometer
+    // reset interrupt flag and get INT_STATUS byte
+    mpuInterrupt = false;
+    mpuIntStatus = mpu.getIntStatus();
 
-  if(start == 0 && angle_acc > -0.5&& angle_acc < 0.5){                     //If the accelerometer angle is almost 0
-    angle_gyro = angle_acc;                                                 //Load the accelerometer angle in the angle_gyro variable
-    start = 1;                                                              //Set the start variable to start the PID controller
-  }
+    // get current FIFO count
+    fifoCount = mpu.getFIFOCount();
+
+    // check for overflow (this should never happen unless our code is too inefficient)
+    if ((mpuIntStatus & _BV(MPU6050_INTERRUPT_FIFO_OFLOW_BIT)) || fifoCount >= 1024) {
+        // reset so we can continue cleanly
+        mpu.resetFIFO();
+        fifoCount = mpu.getFIFOCount();
+        Serial.println(F("FIFO overflow!"));
+
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+    } //else if (mpuIntStatus & _BV(MPU6050_INTERRUPT_DMP_INT_BIT)) {
+      else{
+        // wait for correct available data length, should be a VERY short wait
+        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+        // read a packet from FIFO
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        
+        // track FIFO count here in case there is > 1 packet available
+        // (this lets us immediately read more without waiting for an interrupt)
+        fifoCount -= packetSize;
+            // display Euler angles in degrees
+            //Serial.println();
+            //for(int8_t x:fifoBuffer)
+            //{Serial.print(" "); Serial.print(x);}
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+            /*Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/PI);
+            Serial.print("\t");
+            Serial.println(ypr[2] * 180/PI);*/
+
+        // blink LED to indicate activity
+        blinkState = !blinkState;
+    }
+
+
   
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the gyro
-  Wire.write(0x43);                                                         //Start reading at register 43
-  Wire.endTransmission();                                                   //End the transmission
-  Wire.requestFrom(gyro_address, 4);                                        //Request 4 bytes from the gyro
-  gyro_yaw_data_raw = Wire.read()<<8|Wire.read();                           //Combine the two bytes to make one integer
-  gyro_yaw_data_raw /= GyroScaleFactor;                     
-  gyro_pitch_data_raw = Wire.read()<<8|Wire.read();                         //Combine the two bytes to make one integer
-  gyro_pitch_data_raw /= GyroScaleFactor;
+  angle_acc = (ypr[1] * 180/PI) -90;
+  angle_gyro = angle_acc;
+  Serial.print(" "); Serial.print(angle_acc);
   
-  gyro_pitch_data_raw -= gyro_pitch_calibration_value;                      //Add the gyro calibration value
-  angle_gyro += gyro_pitch_data_raw * 0.000031;                             //Calculate the traveled during this loop angle and add this to the angle_gyro variable
-
-
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  //MPU-6050 offset compensation
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  //Not every gyro is mounted 100% level with the axis of the robot. This can be cause by misalignments during manufacturing of the breakout board. 
-  //As a result the robot will not rotate at the exact same spot and start to make larger and larger circles.
-  //To compensate for this behavior a VERY SMALL angle compensation is needed when the robot is rotating.
-  //Try 0.0000003 or -0.0000003 first to see if there is any improvement.
-
-  gyro_yaw_data_raw -= gyro_yaw_calibration_value;                          //Add the gyro calibration value
-  //Uncomment the following line to make the compensation active
-  //angle_gyro -= gyro_yaw_data_raw * 0.0000003;                            //Compensate the gyro offset when the robot is rotating
-
-  angle_gyro = angle_gyro * 0.9996 + angle_acc * 0.0004;                    //Correct the drift of the gyro angle with the accelerometer angle
-*/
-  if(start == 0 && angle_acc > -1&& angle_acc < 1){                         //If the accelerometer angle is almost 0 eigentlich 0.5
+  if(start == 0 && angle_acc > -5 && angle_acc < 5){                         //If the accelerometer angle is almost 0 eigentlich 0.5
                                                                             //Load the accelerometer angle in the angle_gyro variable
     start = 1;                                                              //Set the start variable to start the PID controller
   }
@@ -209,6 +240,7 @@ void loop()
   //The balancing robot is angle driven. First the difference between the desired angel (setpoint) and actual angle (process value)
   //is calculated. The self_balance_pid_setpoint variable is automatically changed to make sure that the robot stays balanced all the time.
   //The (pid_setpoint - pid_output * 0.015) part functions as a brake function.
+  
   pid_error_temp = angle_gyro - self_balance_pid_setpoint - pid_setpoint;
   Serial.print(" "); Serial.print(pid_error_temp);
   if(pid_output > 10 || pid_output < -10)pid_error_temp += pid_output * 0.015 ;
@@ -232,10 +264,12 @@ void loop()
     self_balance_pid_setpoint = 0;                                          //Reset the self_balance_pid_setpoint variable
   }
 
+  Serial.print(" "); Serial.println(pid_output);
+
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //Control calculations
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  Serial.print(" ");Serial.println(pid_output);// Serial.print(" "); Serial.print(delta);Serial.print(" "); Serial.println(delta2);
+  
   pid_output_left = pid_output;                                             //Copy the controller output to the pid_output_left variable for the left motor
   pid_output_right = pid_output;                                            //Copy the controller output to the pid_output_right variable for the right motor
 /*    LENKUNG KOMMT SPÄTER
@@ -268,7 +302,7 @@ void loop()
     if(pid_output < 0)self_balance_pid_setpoint += 0.0015;                  //Increase the self_balance_pid_setpoint if the robot is still moving forewards
     if(pid_output > 0)self_balance_pid_setpoint -= 0.0015;                  //Decrease the self_balance_pid_setpoint if the robot is still moving backwards
   }
-
+  
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //Motor pulse calculations
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -289,8 +323,8 @@ void loop()
   else right_motor = 0;
 
   //Copy the pulse time to the throttle variables so the interrupt subroutine can use them
-  throttle_left_motor = left_motor/2; // /2 weil nur halbsoviele Halbschritte wie Viertelschritte nötig sind
-  throttle_right_motor = right_motor/2;
+  throttle_left_motor = left_motor; // /2 weil nur halbsoviele Halbschritte wie Viertelschritte nötig sind
+  throttle_right_motor = right_motor;
 
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //Loop time timer
@@ -301,7 +335,7 @@ void loop()
   {
     //delay(0);
   }
-  loop_timer += 4000;
+  loop_timer += 4008;
   double temp = micros();
   delta2 = temp-last2;
   last2 = temp;
@@ -323,7 +357,7 @@ void initTimer()
   timer1_attachInterrupt(timerCall);
   timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP); // 5 ticks/us -> 100 ticks für 20us
   //timer1_enable(TIM_DIV1, TIM_EDGE, TIM_LOOP);
-  timer1_write(200);
+  timer1_write(100);
   //timer1_write(ESP.getCycleCount()+1600L);
 }
 
@@ -375,57 +409,39 @@ const uint8_t MPU6050_REGISTER_ACCEL_XOUT_H =  0x3B;
 const uint8_t MPU6050_REGISTER_SIGNAL_PATH_RESET  = 0x68;
 
 void initGyro()
-{/*
-  //By default the MPU-6050 sleeps. So we have to wake it up.
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the address found during search.
-  Wire.write(0x6B);                                                         //We want to write to the PWR_MGMT_1 register (6B hex)
-  Wire.write(0x00);                                                         //Set the register bits as 00000000 to activate the gyro
-  Wire.endTransmission();                                                   //End the transmission with the gyro.
-  //By default the MPU-6050 sleeps. So we have to wake it up.
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the address found during search.
-  Wire.write(0x6C);                                                         //We want to write to the PWR_MGMT_2 register (6B hex)
-  Wire.write(0x00);                                                         //Set the register bits as 00000000 to activate the gyro
-  Wire.endTransmission();                                                   //End the transmission with the gyro.
-  //Set the full scale of the gyro to +/- 250 degrees per second
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the address found during search.
-  Wire.write(0x1B);                                                         //We want to write to the GYRO_CONFIG register (1B hex)
-  Wire.write(0x00);                                                         //Set the register bits as 00000000 (250dps full scale)
-  Wire.endTransmission();                                                   //End the transmission with the gyro
-  //Set the full scale of the accelerometer to +/- 4g.
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the address found during search.
-  Wire.write(0x1C);                                                         //We want to write to the ACCEL_CONFIG register (1A hex)
-  Wire.write(0x08);                                                         //Set the register bits as 00001000 (+/- 4g full scale range)
-  Wire.endTransmission();                                                   //End the transmission with the gyro
-  //Set some filtering to improve the raw data.
-  Wire.beginTransmission(gyro_address);                                     //Start communication with the address found during search
-  Wire.write(0x1A);                                                         //We want to write to the CONFIG register (1A hex)
-  Wire.write(0x03);                                                         //Set the register bits as 00000011 (Set Digital Low Pass Filter to ~43Hz)
-  Wire.endTransmission();
+{
+  Serial.println(F("Initializing I2C devices..."));
+    mpu.initialize();
 
-  for(receive_counter = 0; receive_counter < 500; receive_counter++){       //Create 500 loops
-    //if(receive_counter % 15 == 0)digitalWrite(13, !digitalRead(13));        //Change the state of the LED every 15 loops to make the LED blink fast
-    Wire.beginTransmission(gyro_address);                                   //Start communication with the gyro
-    Wire.write(0x43);                                                       //Start reading the Who_am_I register 75h
-    Wire.endTransmission();                                                 //End the transmission
-    Wire.requestFrom(gyro_address, 4);                                      //Request 2 bytes from the gyro
-    gyro_yaw_calibration_value += Wire.read()<<8|Wire.read();               //Combine the two bytes to make one integer
-    gyro_pitch_calibration_value += Wire.read()<<8|Wire.read();             //Combine the two bytes to make one integer
-    delayMicroseconds(3700);                                                //Wait for 3700 microseconds to simulate the main program loop time
-  }
-  gyro_pitch_calibration_value /= 500;                                      //Divide the total value by 500 to get the avarage gyro offset
-  gyro_yaw_calibration_value /= 500;                                        //Divide the total value by 500 to get the avarage gyro offset
-  Serial.println("Gyro kalibriert");*/
+    devStatus = mpu.dmpInitialize();
 
-  I2C_Write(gyro_address, MPU6050_REGISTER_SMPLRT_DIV, 0x07);
-  I2C_Write(gyro_address, MPU6050_REGISTER_PWR_MGMT_1, 0x01);
-  I2C_Write(gyro_address, MPU6050_REGISTER_PWR_MGMT_2, 0x00);
-  I2C_Write(gyro_address, MPU6050_REGISTER_CONFIG, 0x00);
-  I2C_Write(gyro_address, MPU6050_REGISTER_GYRO_CONFIG, 0x00);//set +/-250 degree/second full scale
-  I2C_Write(gyro_address, MPU6050_REGISTER_ACCEL_CONFIG, 0x00);// set +/- 2g full scale
-  I2C_Write(gyro_address, MPU6050_REGISTER_FIFO_EN, 0x00);
-  I2C_Write(gyro_address, MPU6050_REGISTER_INT_ENABLE, 0x01);
-  I2C_Write(gyro_address, MPU6050_REGISTER_SIGNAL_PATH_RESET, 0x00);
-  I2C_Write(gyro_address, MPU6050_REGISTER_USER_CTRL, 0x00);
+    // supply your own gyro offsets here, scaled for min sensitivity
+    mpu.setXGyroOffset(-7);
+    mpu.setYGyroOffset(-4);
+    mpu.setZGyroOffset(-60);
+    mpu.setXAccelOffset(-4121);
+    mpu.setYAccelOffset(-1047);
+    mpu.setZAccelOffset(654); // 1688 factory default for my test chip
+
+    // make sure it worked (returns 0 if so)
+    if (devStatus == 0) {
+        // turn on the DMP, now that it's ready
+        Serial.println(F("Enabling DMP..."));
+        mpu.setDMPEnabled(true);
+
+        // enable Arduino interrupt detection
+        Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+        //Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+        Serial.println(F(")..."));
+        //attachInterrupt(digitalPinToInterrupt(D0), dmpDataReady, RISING);
+        mpuIntStatus = mpu.getIntStatus();
+
+        
+        dmpReady = true;
+
+        // get expected DMP packet size for later comparison
+        packetSize = mpu.dmpGetFIFOPacketSize();
+    } 
 
 }
 
