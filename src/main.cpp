@@ -117,6 +117,26 @@ MPU6050 mpu;
 //#define OUTPUT_TEAPOT
 
 
+#include "ESP8266WiFi.h"
+#include "WiFiUdp.h"
+
+const char *ssid = "Robot_01";
+const char *pass = "letmeaccessyourdata";
+
+unsigned int localPort = 2000; // local port to listen for UDP packets
+
+IPAddress ServerIP(192,168,4,1);
+IPAddress ClientIP(192,168,4,2);
+
+// A UDP instance to let us send and receive packets over UDP
+//unsigned int localUdpPort = 4210;  // local port to listen on
+WiFiUDP udp;
+byte incomingPacket[1];  // buffer for incoming packets
+
+byte xpot = 127;
+byte ypot = 128;
+
+char controll = 0;
 
 #define INTERRUPT_PIN D2  // use pin 2 on Arduino Uno & most boards
 #define LED_PIN 13 // (Arduino is 13, Teensy is 11, Teensy++ is 6)
@@ -175,6 +195,8 @@ void timerCall();
 void initGPIO();
 void initMultiplexer();
 void readMultiplexer(double *p, double *i, double *d, double *v);
+void initNetwork();
+void readDir();
 
 //MOTOR 1
 #define DIR 16
@@ -185,6 +207,8 @@ void readMultiplexer(double *p, double *i, double *d, double *v);
 
 const int S0 = D7;      // Multiplex Set Pin
 const int S1 = D8;      // Multiplex Set Pin
+
+byte pidsetting = 0;
 
 
 
@@ -284,6 +308,7 @@ void setup() {
     // configure LED for output
     //pinMode(LED_PIN, OUTPUT);
     initGPIO();
+    initNetwork();
     initTimer();
 }
 
@@ -296,26 +321,6 @@ int dfguiigguzi =0;
 void loop() {
     // if programming failed, don't try to do anything
     if (!dmpReady) return;
-/*
-    // wait for MPU interrupt or extra packet(s) available
-    while (!mpuInterrupt && fifoCount < packetSize) {
-        if (mpuInterrupt && fifoCount < packetSize) {
-          // try to get out of the infinite loop 
-          fifoCount = mpu.getFIFOCount();
-        }  
-        Serial.println(fifoCount);
-        // other program behavior stuff here
-        // .
-        // .
-        // .
-        // if you are really paranoid you can frequently test in between other
-        // stuff to see if mpuInterrupt is true, and if so, "break;" from the
-        // while() loop to immediately process the MPU data
-        // .
-        // .
-        // .
-    }
-*/
     // reset interrupt flag and get INT_STATUS byte
     mpuInterrupt = false;
     mpuIntStatus = mpu.getIntStatus();
@@ -430,27 +435,37 @@ void loop() {
         digitalWrite(LED_PIN, blinkState);
     }
     //angle_gyro = ypr[1] * 180/M_PI -90;
-    Serial.print(angle_gyro);
+    //Serial.print(angle_gyro);
 
+    readDir();
 
     if(start == 0 && angle_acc > -5 && angle_acc < 5){                         //If the accelerometer angle is almost 0 eigentlich 0.5
         start = 1;                                                                 //Load the accelerometer angle in the angle_gyro variable
                                                                                //Set the start variable to start the PID controller
   }
 
-    double p = 0;
-    double i = 0;
-    double d = 0;
-    double v = 0;
-    readMultiplexer(&p,&i,&d, &v);
-    pid_p_gain = 10+10*p/1024;
-    pid_i_gain = 1+.5*i/1024;
-    pid_d_gain = 15+10*d/1024;
-    Serial.print(" P=");Serial.print(pid_p_gain);Serial.print(" I=");Serial.print(pid_i_gain);Serial.print(" D=");Serial.print(pid_d_gain
-    );
+    if(pidsetting == 0)
+    {
+      double p = 0;
+      double i = 0;
+      double d = 0;
+      double v = 0;
+      readMultiplexer(&p,&i,&d, &v);
+      pid_p_gain = 10+15*p/1024;
+      pid_i_gain = 0.8+.7*i/1024;
+      pid_d_gain = 15+10*d/1024;
+    }
+    else if(pidsetting == 1)
+    {
+      pid_p_gain = 20.94;
+      pid_i_gain = 1.07;
+      pid_d_gain = 25;
+    }
+    //Serial.println(pid_setpoint);
+    Serial.print(" P=");Serial.print(pid_p_gain);Serial.print(" I=");Serial.print(pid_i_gain);Serial.print(" D=");Serial.println(pid_d_gain);
     //PID
     pid_error_temp = angle_gyro - self_balance_pid_setpoint - pid_setpoint;
-    Serial.print(" "); Serial.print(pid_error_temp);
+    //Serial.print(" "); Serial.print(pid_error_temp);
     if(pid_output > 10 || pid_output < -10)pid_error_temp += pid_output * 0.015 ;
 
     pid_i_mem += pid_i_gain * pid_error_temp;                                 //Calculate the I-controller value and add it to the pid_i_mem variable
@@ -472,10 +487,39 @@ void loop() {
     self_balance_pid_setpoint = 0;                                          //Reset the self_balance_pid_setpoint variable
   }
     
-    Serial.print(" "); Serial.print(pid_output);
-    Serial.print(" "); Serial.println(dfguiigguzi);
+    //Serial.print(" "); Serial.print(pid_output);
+    //Serial.print(" "); Serial.println(dfguiigguzi);
     pid_output_left = pid_output;                                             //Copy the controller output to the pid_output_left variable for the left motor
     pid_output_right = pid_output;
+
+    if(controll=='8'||controll=='1' ||controll=='5')
+    {
+      if(pid_setpoint < 3.3)pid_setpoint += 0.05;                             //Slowly change the setpoint angle so the robot starts leaning backwards
+      if(pid_output < max_target_speed)pid_setpoint += 0.005;                 //Slowly change the setpoint angle so the robot starts leaning backwards
+    }
+    else if(controll=='7'||controll=='3'||controll=='6')
+    {
+      if(pid_setpoint > -3.3)pid_setpoint -= 0.05;                            //Slowly change the setpoint angle so the robot starts leaning forewards
+      if(pid_output > max_target_speed * -1)pid_setpoint -= 0.005;            //Slowly change the setpoint angle so the robot starts leaning forewards
+    }
+    else
+    {
+      pid_setpoint = 0;
+    }
+
+    if(controll=='5'||controll=='2'||controll=='6')
+    {
+      pid_output_left -= 60;
+      pid_output_right += 60;
+
+    }
+    else if(controll=='8'||controll=='4'||controll=='7')
+    {
+      pid_output_left +=60;
+      pid_output_right -= 60;
+    }
+    
+    
 
     if(pid_setpoint == 0){                                                    //If the setpoint is zero degrees
     if(pid_output < 0)self_balance_pid_setpoint += 0.0015;                  //Increase the self_balance_pid_setpoint if the robot is still moving forewards
@@ -504,7 +548,7 @@ void loop() {
     
     while(loop_timer > micros())
     {
-        //delay(0);
+        yield();
     }
     loop_timer += 4000;
 
@@ -593,5 +637,48 @@ void readMultiplexer(double *p, double *i, double *d, double *v)
   *v = analogRead(A0);*/
 }
 
+IPAddress local_IP(192,168,4,1);
+IPAddress gateway(192,168,4,9);
+IPAddress subnet(255,255,255,0);
+
+void initNetwork()
+{
+  WiFi.begin(ssid, pass);
+  /*while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }*/
+  udp.begin(2000);
+}
+
+void readDir()
+{
+  int packetSize = udp.parsePacket();
+  //Serial.print("Packetsize= ");
+  //Serial.println(packetSize);
+  if (packetSize)
+  {
+    int len = udp.read(incomingPacket, 7);
+    if (len > 0)
+    {
+      incomingPacket[len] = 0;
+    }
+    char c = incomingPacket[0];
+    
+    if(0>=0&&c<='8')
+    {
+      controll = c;
+    }
+    else if(c == 'c')
+    {
+      pidsetting = 0;
+    }
+    else if(c == 'z')
+    {
+      pidsetting = 0;
+    }
+    
+  }
+}
 
 
